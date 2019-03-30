@@ -16,6 +16,7 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
@@ -38,7 +39,7 @@ func (xh *xdsHandler) fetch(req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, er
 	if !ok {
 		return nil, fmt.Errorf("no resource registered for typeURL %q", req.TypeUrl)
 	}
-	resources, err := toAny(r, toFilter(req.ResourceNames))
+	resources, err := toAny(r, toFilter(req.ResourceNames), nil)
 	return &v2.DiscoveryResponse{
 		VersionInfo: "0",
 		Resources:   resources,
@@ -76,6 +77,9 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 	last := -1
 	ctx := st.Context()
 
+	lastValues := make(map[string]proto.Message)
+
+	first := true
 	// now stick in this loop until the client disconnects.
 	for {
 		// first we wait for the request from Envoy, this is part of
@@ -96,9 +100,11 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 		// so the next time around the loop all is forgotten.
 		log := log.WithField("version_info", req.VersionInfo).WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl).WithField("response_nonce", req.ResponseNonce).WithField("error_detail", req.ErrorDetail)
 
-		for {
-			log.Info("stream_wait")
+		log.Info("request")
 
+		responsed := false
+
+		for !responsed {
 			// now we wait for a notification, if this is the first time through the loop
 			// then last will be zero and that will trigger a notification immediately.
 			r.Register(ch, last)
@@ -111,23 +117,31 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 				// generate a filter from the request, then call toAny which
 				// will get r's (our resource) filter values, then convert them
 				// to the types.Any from required by gRPC.
-				resources, err := toAny(r, toFilter(req.ResourceNames))
+				resources, err := toAny(r, toFilter(req.ResourceNames), lastValues)
 				if err != nil {
 					return err
 				}
 
-				resp := &v2.DiscoveryResponse{
-					VersionInfo: "0",
-					Resources:   resources,
-					TypeUrl:     r.TypeURL(),
-					Nonce:       "0",
+				// response anyway for the first time
+				if len(resources) > 0 || first {
+					resp := &v2.DiscoveryResponse{
+						VersionInfo: strconv.Itoa(last),
+						Resources:   resources,
+						TypeUrl:     r.TypeURL(),
+						Nonce:       strconv.Itoa(last),
+					}
+					if err := st.Send(resp); err != nil {
+						return err
+					}
+					log.WithField("count", len(resources)).WithField("response_version_info", strconv.Itoa(last)).Info("response")
+					responsed = true
+				} else {
+					log.Info("no_change")
 				}
-				if err := st.Send(resp); err != nil {
-					return err
-				}
-				log.WithField("count", len(resources)).Info("response")
 
-				// ok, the client hung up, return any error stored in the context and we're done.
+				first = false
+
+			// ok, the client hung up, return any error stored in the context and we're done.
 			case <-ctx.Done():
 				return ctx.Err()
 			}
@@ -137,16 +151,47 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 
 // toAny converts the contents of a resourcer's Values to the
 // respective slice of types.Any.
-func toAny(res resource, filter func(string) bool) ([]types.Any, error) {
+func toAny(res resource, filter func(string) bool, lastValues map[string]proto.Message) ([]types.Any, error) {
 	v := res.Values(filter)
-	resources := make([]types.Any, len(v))
+	var resources []types.Any
+	changed := false
 	for i := range v {
+		typeUrl := res.TypeURL()
+		n := ""
+		if typeUrl == endpointType {
+			n = v[i].(*v2.ClusterLoadAssignment).ClusterName
+		} else if typeUrl == routeType {
+			n = v[i].(*v2.RouteConfiguration).Name
+			rc := v[i].(*v2.RouteConfiguration)
+			fmt.Printf("Listener: %v\n", rc)
+		} else if typeUrl == clusterType {
+			n = v[i].(*v2.Cluster).Name
+		} else if typeUrl == listenerType {
+			n = v[i].(*v2.Listener).Name
+			lt := v[i].(*v2.Listener)
+			fmt.Printf("Listener: %v\n", lt)
+		}
+
 		value, err := proto.Marshal(v[i])
 		if err != nil {
 			return nil, err
 		}
-		resources[i] = types.Any{TypeUrl: res.TypeURL(), Value: value}
+
+		if lastValues == nil || !proto.Equal(v[i], lastValues[n]) {
+			changed = true
+			resources = append(resources, types.Any{TypeUrl: typeUrl, Value: value})
+			if lastValues != nil {
+				lastValues[n] = v[i]
+			}
+		} else if typeUrl == clusterType || typeUrl == listenerType {
+			resources = append(resources, types.Any{TypeUrl: typeUrl, Value: value})
+		}
 	}
+
+	if !changed {
+		resources = resources[:0]
+	}
+
 	return resources, nil
 }
 
