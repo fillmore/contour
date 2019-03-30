@@ -17,7 +17,9 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/gogo/protobuf/proto"
@@ -80,31 +82,71 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 	lastValues := make(map[string]proto.Message)
 
 	first := true
+	errch := make(chan error, 1)
+	var mu sync.Mutex
+	var reqQueue []*v2.DiscoveryRequest
+	go func() {
+		for {
+			// first we wait for the request from Envoy, this is part of
+			// the xDS protocol.
+			req, err := st.Recv()
+			if err != nil {
+				errch<-err
+				return
+			}
+
+			// stick some debugging details on the logger, not that we redeclare log in this scope
+			// so the next time around the loop all is forgotten.
+			recvlog := log.WithField("version_info", req.VersionInfo).WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl).WithField("response_nonce", req.ResponseNonce).WithField("error_detail", req.ErrorDetail)
+
+			recvlog.Info("recv_request")
+
+			mu.Lock()
+			reqQueue = append(reqQueue, req)
+			mu.Unlock()
+		}
+	}()
+
 	// now stick in this loop until the client disconnects.
 	for {
-		// first we wait for the request from Envoy, this is part of
-		// the xDS protocol.
-		req, err := st.Recv()
-		if err != nil {
-			return err
+		for len(reqQueue) == 0 {
+			select {
+				case err := <-errch:
+					return err
+				case <-time.After(3 * time.Second):
+					continue
+			}
 		}
-
-		// from the request we derive the resource to stream which have
-		// been registered according to the typeURL.
-		r, ok := xh.resources[req.TypeUrl]
-		if !ok {
-			return fmt.Errorf("no resource registered for typeURL %q", req.TypeUrl)
-		}
-
-		// stick some debugging details on the logger, not that we redeclare log in this scope
-		// so the next time around the loop all is forgotten.
-		log := log.WithField("version_info", req.VersionInfo).WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl).WithField("response_nonce", req.ResponseNonce).WithField("error_detail", req.ErrorDetail)
-
-		log.Info("request")
 
 		responsed := false
-
+		var req *v2.DiscoveryRequest
+		var r resource
+		resplog := log
 		for !responsed {
+			if len(reqQueue) > 0 {
+				// only take last request
+				mu.Lock()
+				currLen := len(reqQueue)
+				req = reqQueue[currLen - 1]
+				reqQueue = reqQueue[:0]
+				mu.Unlock()
+
+				// stick some debugging details on the logger, not that we redeclare log in this scope
+				// so the next time around the loop all is forgotten.
+				reqlog := log.WithField("req_queue_count", currLen).WithField("version_info", req.VersionInfo).WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl).WithField("response_nonce", req.ResponseNonce).WithField("error_detail", req.ErrorDetail)
+				resplog = reqlog
+				reqlog.Info("process_request")
+
+				// from the request we derive the resource to stream which have
+				// been registered according to the typeURL.
+				ri, ok := xh.resources[req.TypeUrl]
+				if !ok {
+					return fmt.Errorf("no resource registered for typeURL %q", req.TypeUrl)
+				}
+
+				r = ri
+			}
+
 			// now we wait for a notification, if this is the first time through the loop
 			// then last will be zero and that will trigger a notification immediately.
 			r.Register(ch, last)
@@ -123,20 +165,21 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 				}
 
 				// response anyway for the first time
+				version := strconv.Itoa(last)
 				if len(resources) > 0 || first {
 					resp := &v2.DiscoveryResponse{
-						VersionInfo: strconv.Itoa(last),
+						VersionInfo: version,
 						Resources:   resources,
 						TypeUrl:     r.TypeURL(),
-						Nonce:       strconv.Itoa(last),
+						Nonce:       version,
 					}
 					if err := st.Send(resp); err != nil {
 						return err
 					}
-					log.WithField("count", len(resources)).WithField("response_version_info", strconv.Itoa(last)).Info("response")
+					resplog.WithField("count", len(resources)).WithField("response_version_info", version).Info("response")
 					responsed = true
 				} else {
-					log.Info("no_change")
+					resplog.Info("no_change")
 				}
 
 				first = false
