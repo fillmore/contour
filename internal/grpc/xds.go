@@ -152,6 +152,11 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 // toAny converts the contents of a resourcer's Values to the
 // respective slice of types.Any.
 func toAny(res resource, filter func(string) bool, lastValues map[string]proto.Message) ([]types.Any, error) {
+	currentNames := make(map[string]bool)
+	for name, _ := range lastValues {
+		currentNames[name] = false
+	}
+
 	v := res.Values(filter)
 	var resources []types.Any
 	changed := false
@@ -172,6 +177,7 @@ func toAny(res resource, filter func(string) bool, lastValues map[string]proto.M
 			fmt.Printf("Listener: %v\n", lt)
 		}
 
+		currentNames[n] = true
 		value, err := proto.Marshal(v[i])
 		if err != nil {
 			return nil, err
@@ -190,6 +196,12 @@ func toAny(res resource, filter func(string) bool, lastValues map[string]proto.M
 
 	if !changed {
 		resources = resources[:0]
+	}
+
+	for name, exist := range currentNames {
+		if exist {
+			delete(lastValues, name)
+		}
 	}
 
 	return resources, nil
