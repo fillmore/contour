@@ -167,14 +167,10 @@ func toAny(res resource, filter func(string) bool, lastValues map[string]proto.M
 			n = v[i].(*v2.ClusterLoadAssignment).ClusterName
 		} else if typeUrl == routeType {
 			n = v[i].(*v2.RouteConfiguration).Name
-			rc := v[i].(*v2.RouteConfiguration)
-			fmt.Printf("Listener: %v\n", rc)
 		} else if typeUrl == clusterType {
 			n = v[i].(*v2.Cluster).Name
 		} else if typeUrl == listenerType {
 			n = v[i].(*v2.Listener).Name
-			lt := v[i].(*v2.Listener)
-			fmt.Printf("Listener: %v\n", lt)
 		}
 
 		currentNames[n] = true
